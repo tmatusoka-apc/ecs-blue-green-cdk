@@ -1,0 +1,1 @@
+{\n  "app": "npx ts-node bin/ecs-blue-green.ts",\n  "context": {\n    "projectName": "ecs-blue-green",\n    "region": "ap-northeast-1"\n  }\n}
