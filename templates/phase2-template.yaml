@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Phase 2 - ECS Fargate Blue/Green Deployment'
+
+Parameters:
+  Phase1StackName:
+    Type: String
+    Default: phase1-stack
+    Description: Phase 1 stack name for VPC and cluster
+  EnvironmentName:
+    Type: String
+    Default: phase2
+    Description: Environment name
+
+Resources:
+  # Green Target Group
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: phase2-green-tg
+      Port: 3000
+      Protocol: TCP
+      VpcId:
+        Fn::ImportValue: !Sub phase1-vpc-id
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckProtocol: TCP
+      HealthCheckPort: '3000'
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  # CloudWatch Log Group
+  GreenECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}
+      RetentionInDays: 7
+
+  # IAM Role for ECS Task Execution
+  GreenECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ecs-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # IAM Role for ECS Task
+  GreenECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # Green Task Definition
+  GreenTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt GreenECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt GreenECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub ${EnvironmentName}-container
+          Image: nginx:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref GreenECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # Green ECS Service
+  GreenECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-service
+      Cluster:
+        Fn::ImportValue: phase1-cluster-id
+      TaskDefinition: !Ref GreenTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - Fn::ImportValue: phase1-subnet-a-id
+            - Fn::ImportValue: phase1-subnet-b-id
+          SecurityGroups:
+            - Fn::ImportValue: phase1-sg-id
+      LoadBalancers:
+        - ContainerName: !Sub ${EnvironmentName}-container
+          ContainerPort: 3000
+          TargetGroupArn: !Ref GreenTargetGroup
+
+  # S3 Bucket for Artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-artifacts-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ElbAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:ModifyListener
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeListeners
+                Resource: '*'
+
+  # Lambda Function for Blue/Green Switch
+  BlueGreenSwitcherLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-blue-green-switcher
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          elb_client = boto3.client('elbv2')
+
+          def handler(event, context):
+              """
+              Switch traffic from Blue to Green target group
+              """
+              try:
+                  # Get NLB listener ARN from event
+                  listener_arn = event.get('listener_arn')
+                  target_group_arn = event.get('target_group_arn')
+
+                  if not listener_arn or not target_group_arn:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Missing listener_arn or target_group_arn')
+                      }
+
+                  # Modify listener to point to new target group
+                  response = elb_client.modify_listener(
+                      ListenerArn=listener_arn,
+                      DefaultActions=[
+                          {
+                              'Type': 'forward',
+                              'TargetGroupArn': target_group_arn
+                          }
+                      ]
+                  )
+
+                  logger.info(f"Successfully switched traffic to {target_group_arn}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Traffic switched successfully')
+                  }
+
+              except Exception as e:
+                  logger.error(f"Error switching traffic: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+Outputs:
+  GreenTargetGroupArn:
+    Description: Green Target Group ARN
+    Value: !Ref GreenTargetGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-green-tg-arn
+
+  GreenServiceName:
+    Description: Green ECS Service Name
+    Value: !GetAtt GreenECSService.ServiceName
+    Export:
+      Name: !Sub ${EnvironmentName}-service-name
+
+  BlueGreenSwitcherLambdaArn:
+    Description: Blue/Green Switcher Lambda ARN
+    Value: !GetAtt BlueGreenSwitcherLambda.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-switcher-lambda-arn
+
+  ArtifactBucketName:
+    Description: S3 Artifact Bucket Name
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-artifact-bucket
