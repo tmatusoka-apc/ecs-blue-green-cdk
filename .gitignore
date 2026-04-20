@@ -1,0 +1,18 @@
+# .gitignore for AWS CDK, Node, IDE and OS files
+
+# AWS CDK
+.node_modules/
+.cdk.staging/
+.cdk.out/
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
